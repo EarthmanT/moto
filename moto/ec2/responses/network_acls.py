@@ -96,7 +96,7 @@ DESCRIBE_NETWORK_ACL_RESPONSE = """
    <item>
      <networkAclId>{{ network_acl.id }}</networkAclId>
      <vpcId>{{ network_acl.vpc_id }}</vpcId>
-     <default>{{ network_acl.default }}</default>
+     <default>true</default>
      <entrySet>
        {% for entry in network_acl.network_acl_entries %}
          <item>

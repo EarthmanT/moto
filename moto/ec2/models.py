@@ -2610,12 +2610,10 @@ class NetworkAcl(TaggedEC2Resource):
         self.vpc_id = vpc_id
         self.network_acl_entries = []
         self.associations = {}
-        self.default = 'true' if default is True else 'false'
+        self.default = default
 
     def get_filter_value(self, filter_name):
-        if filter_name == "default":
-            return self.default
-        elif filter_name == "vpc-id":
+        if filter_name == "vpc-id":
             return self.vpc_id
         elif filter_name == "association.network-acl-id":
             return self.id
