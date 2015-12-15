@@ -323,12 +323,6 @@ class Instance(BotoInstance, TaggedEC2Resource):
             # If we are in EC2-Classic, autoassign a public IP
             associate_public_ip = True
 
-        self.block_device_mapping = BlockDeviceMapping()
-        # Default have an instance with root volume should you not wish to override with attach volume cmd.
-        # However this is a ghost volume and wont show up in get_all_volumes or snapshot-able.
-        self.block_device_mapping['/dev/sda1'] = BlockDeviceType(volume_id=random_volume_id(), status='attached',
-                                                                 attach_time=utc_date_and_time())
-
         amis = self.ec2_backend.describe_images(filters={'image-id': image_id})
         ami = amis[0] if amis else None
 
@@ -349,10 +343,22 @@ class Instance(BotoInstance, TaggedEC2Resource):
             subnet = ec2_backend.get_subnet(self.subnet_id)
             self.vpc_id = subnet.vpc_id
 
+        self.block_device_mapping = BlockDeviceMapping()
+
         self.prep_nics(kwargs.get("nics", {}),
                        subnet_id=self.subnet_id,
                        private_ip=kwargs.get("private_ip"),
                        associate_public_ip=associate_public_ip)
+
+    def setup_defaults(self):
+        # Default have an instance with root volume should you not wish to override with attach volume cmd.
+        volume = self.ec2_backend.create_volume(8, 'us-east-1a')
+        self.ec2_backend.attach_volume(volume.id, self.id, '/dev/sda1')
+
+    def teardown_defaults(self):
+        volume_id = self.block_device_mapping['/dev/sda1'].volume_id
+        self.ec2_backend.detach_volume(volume_id, self.id, '/dev/sda1')
+        self.ec2_backend.delete_volume(volume_id)
 
     @property
     def get_block_device_mapping(self):
@@ -423,6 +429,8 @@ class Instance(BotoInstance, TaggedEC2Resource):
     def terminate(self, *args, **kwargs):
         for nic in self.nics.values():
             nic.stop()
+
+        self.teardown_defaults()
 
         self._state.name = "terminated"
         self._state.code = 48
@@ -550,6 +558,7 @@ class InstanceBackend(object):
                            for name in security_group_names]
         security_groups.extend(self.get_security_group_from_id(sg_id)
                                for sg_id in kwargs.pop("security_group_ids", []))
+        self.reservations[new_reservation.id] = new_reservation
         for index in range(count):
             new_instance = Instance(
                 self,
@@ -559,7 +568,7 @@ class InstanceBackend(object):
                 **kwargs
             )
             new_reservation.instances.append(new_instance)
-        self.reservations[new_reservation.id] = new_reservation
+            new_instance.setup_defaults()
         return new_reservation
 
     def start_instances(self, instance_ids):
@@ -1538,12 +1547,13 @@ class EBSBackend(object):
 
 
 class VPC(TaggedEC2Resource):
-    def __init__(self, ec2_backend, vpc_id, cidr_block):
+    def __init__(self, ec2_backend, vpc_id, cidr_block, is_default):
         self.ec2_backend = ec2_backend
         self.id = vpc_id
         self.cidr_block = cidr_block
         self.dhcp_options = None
         self.state = 'available'
+        self.is_default = is_default
 
     @classmethod
     def create_from_cloudformation_json(cls, resource_name, cloudformation_json, region_name):
@@ -1585,7 +1595,7 @@ class VPCBackend(object):
 
     def create_vpc(self, cidr_block):
         vpc_id = random_vpc_id()
-        vpc = VPC(self, vpc_id, cidr_block)
+        vpc = VPC(self, vpc_id, cidr_block, len(self.vpcs) == 0)
         self.vpcs[vpc_id] = vpc
 
         # AWS creates a default main route table and security group.
@@ -1729,12 +1739,13 @@ class VPCPeeringConnectionBackend(object):
 
 
 class Subnet(TaggedEC2Resource):
-    def __init__(self, ec2_backend, subnet_id, vpc_id, cidr_block, availability_zone):
+    def __init__(self, ec2_backend, subnet_id, vpc_id, cidr_block, availability_zone, defaultForAz):
         self.ec2_backend = ec2_backend
         self.id = subnet_id
         self.vpc_id = vpc_id
         self.cidr_block = cidr_block
         self._availability_zone = availability_zone
+        self.defaultForAz = defaultForAz
 
     @classmethod
     def create_from_cloudformation_json(cls, resource_name, cloudformation_json, region_name):
@@ -1794,6 +1805,8 @@ class Subnet(TaggedEC2Resource):
             return self.id
         elif filter_name == 'availabilityZone':
             return self.availability_zone
+        elif filter_name == 'defaultForAz':
+            return self.defaultForAz
 
         filter_value = super(Subnet, self).get_filter_value(filter_name)
 
@@ -1822,8 +1835,9 @@ class SubnetBackend(object):
 
     def create_subnet(self, vpc_id, cidr_block, availability_zone=None):
         subnet_id = random_subnet_id()
-        subnet = Subnet(self, subnet_id, vpc_id, cidr_block, availability_zone)
-        self.get_vpc(vpc_id)  # Validate VPC exists
+        vpc = self.get_vpc(vpc_id)  # Validate VPC exists
+        defaultForAz = "true" if vpc.is_default else "false"
+        subnet = Subnet(self, subnet_id, vpc_id, cidr_block, availability_zone, defaultForAz)
 
         # AWS associates a new subnet with the default Network ACL
         self.associate_default_network_acl_with_subnet(subnet_id)

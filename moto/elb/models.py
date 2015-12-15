@@ -10,6 +10,7 @@ from boto.ec2.elb.attributes import (
 )
 from boto.ec2.elb.policies import Policies
 from moto.core import BaseBackend
+from .exceptions import LoadBalancerNotFoundError, TooManyTagsError
 
 
 class FakeHealthCheck(object):
@@ -44,18 +45,20 @@ class FakeBackend(object):
 
 
 class FakeLoadBalancer(object):
-    def __init__(self, name, zones, ports):
+    def __init__(self, name, zones, ports, scheme='internet-facing',):
         self.name = name
         self.health_check = None
         self.instance_ids = []
         self.zones = zones
         self.listeners = []
         self.backends = []
+        self.scheme = scheme
         self.attributes = FakeLoadBalancer.get_default_attributes()
         self.policies = Policies()
         self.policies.other_policies = []
         self.policies.app_cookie_stickiness_policies = []
         self.policies.lb_cookie_stickiness_policies = []
+        self.tags = {}
 
         for port in ports:
             listener = FakeListener(
@@ -129,14 +132,26 @@ class FakeLoadBalancer(object):
 
         return attributes
 
+    def add_tag(self, key, value):
+        if len(self.tags) >= 10 and key not in self.tags:
+            raise TooManyTagsError()
+        self.tags[key] = value
+
+    def list_tags(self):
+        return self.tags
+
+    def remove_tag(self, key):
+        if key in self.tags:
+            del self.tags[key]
+
 
 class ELBBackend(BaseBackend):
 
     def __init__(self):
         self.load_balancers = {}
 
-    def create_load_balancer(self, name, zones, ports):
-        new_load_balancer = FakeLoadBalancer(name=name, zones=zones, ports=ports)
+    def create_load_balancer(self, name, zones, ports, scheme='internet-facing'):
+        new_load_balancer = FakeLoadBalancer(name=name, zones=zones, ports=ports, scheme=scheme)
         self.load_balancers[name] = new_load_balancer
         return new_load_balancer
 
@@ -159,7 +174,11 @@ class ELBBackend(BaseBackend):
     def describe_load_balancers(self, names):
         balancers = self.load_balancers.values()
         if names:
-            return [balancer for balancer in balancers if balancer.name in names]
+            matched_balancers = [balancer for balancer in balancers if balancer.name in names]
+            if len(names) != len(matched_balancers):
+                missing_elb = list(set(names) - set(matched_balancers))[0]
+                raise LoadBalancerNotFoundError(missing_elb)
+            return matched_balancers
         else:
             return balancers
 

@@ -1,5 +1,6 @@
 from __future__ import unicode_literals
 import boto3
+import botocore
 import boto
 import boto.ec2.elb
 from boto.ec2.elb import HealthCheck
@@ -14,10 +15,10 @@ from boto.ec2.elb.policies import (
     LBCookieStickinessPolicy,
     OtherPolicy,
 )
+from boto.exception import BotoServerError
 import sure  # noqa
 
 from moto import mock_elb, mock_ec2
-
 
 @mock_elb
 def test_create_load_balancer():
@@ -25,11 +26,12 @@ def test_create_load_balancer():
 
     zones = ['us-east-1a', 'us-east-1b']
     ports = [(80, 8080, 'http'), (443, 8443, 'tcp')]
-    conn.create_load_balancer('my-lb', zones, ports)
+    conn.create_load_balancer('my-lb', zones, ports, scheme='internal')
 
     balancers = conn.get_all_load_balancers()
     balancer = balancers[0]
     balancer.name.should.equal("my-lb")
+    balancer.scheme.should.equal("internal")
     set(balancer.availability_zones).should.equal(set(['us-east-1a', 'us-east-1b']))
     listener1 = balancer.listeners[0]
     listener1.load_balancer_port.should.equal(80)
@@ -39,6 +41,12 @@ def test_create_load_balancer():
     listener2.load_balancer_port.should.equal(443)
     listener2.instance_port.should.equal(8443)
     listener2.protocol.should.equal("TCP")
+
+
+@mock_elb
+def test_getting_missing_elb():
+    conn = boto.connect_elb()
+    conn.get_all_load_balancers.when.called_with(load_balancer_names='aaa').should.throw(BotoServerError)
 
 
 @mock_elb
@@ -66,6 +74,7 @@ def test_create_load_balancer_with_certificate():
     balancers = conn.get_all_load_balancers()
     balancer = balancers[0]
     balancer.name.should.equal("my-lb")
+    balancer.scheme.should.equal("internet-facing")
     set(balancer.availability_zones).should.equal(set(['us-east-1a']))
     listener = balancer.listeners[0]
     listener.load_balancer_port.should.equal(443)
@@ -544,7 +553,7 @@ def test_set_policies_of_backend_server():
 
     # in a real flow, it is necessary first to create a policy,
     # then to set that policy to the backend
-    lb.create_lb_policy(policy_name, 'ProxyProtocolPolicyType', {'ProxyProtocol': True}) 
+    lb.create_lb_policy(policy_name, 'ProxyProtocolPolicyType', {'ProxyProtocol': True})
     lb.set_policies_of_backend_server(instance_port, [policy_name])
 
     lb = conn.get_all_load_balancers()[0]
@@ -581,3 +590,111 @@ def test_describe_instance_health():
     instances_health.should.have.length_of(1)
     instances_health[0].instance_id.should.equal(instance_id1)
     instances_health[0].state.should.equal('InService')
+
+
+@mock_elb
+def test_add_remove_tags():
+    client = boto3.client('elb', region_name='us-east-1')
+
+    client.add_tags.when.called_with(LoadBalancerNames=['my-lb'],
+                    Tags=[{
+                       'Key': 'a',
+                       'Value': 'b'
+                    }]).should.throw(botocore.exceptions.ClientError)
+
+
+    client.create_load_balancer(
+        LoadBalancerName='my-lb',
+        Listeners=[{'Protocol':'tcp', 'LoadBalancerPort':80, 'InstancePort':8080}],
+        AvailabilityZones=['us-east-1a', 'us-east-1b']
+    )
+
+    list(client.describe_load_balancers()['LoadBalancerDescriptions']).should.have.length_of(1)
+
+    client.add_tags(LoadBalancerNames=['my-lb'],
+                    Tags=[{
+                       'Key': 'a',
+                       'Value': 'a'
+                    }])
+
+    tags = dict([(d['Key'], d['Value']) for d in client.describe_tags(LoadBalancerNames=['my-lb'])['TagDescriptions'][0]['Tags']])
+    tags.should.have('a').should.equal('a')
+
+    client.add_tags(LoadBalancerNames=['my-lb'],
+                    Tags=[{
+                       'Key': 'a',
+                       'Value': 'b'
+                    }, {
+                       'Key': 'b',
+                       'Value': 'b'
+                    }, {
+                       'Key': 'c',
+                       'Value': 'b'
+                    }, {
+                       'Key': 'd',
+                       'Value': 'b'
+                    }, {
+                       'Key': 'e',
+                       'Value': 'b'
+                    }, {
+                       'Key': 'f',
+                       'Value': 'b'
+                    }, {
+                       'Key': 'g',
+                       'Value': 'b'
+                    }, {
+                       'Key': 'h',
+                       'Value': 'b'
+                    }, {
+                       'Key': 'i',
+                       'Value': 'b'
+                    }, {
+                       'Key': 'j',
+                       'Value': 'b'
+                    }])
+
+    client.add_tags.when.called_with(LoadBalancerNames=['my-lb'],
+                    Tags=[{
+                       'Key': 'k',
+                       'Value': 'b'
+                    }]).should.throw(botocore.exceptions.ClientError)
+
+    client.add_tags(LoadBalancerNames=['my-lb'],
+                    Tags=[{
+                       'Key': 'j',
+                       'Value': 'c'
+                    }])
+
+
+    tags = dict([(d['Key'], d['Value']) for d in client.describe_tags(LoadBalancerNames=['my-lb'])['TagDescriptions'][0]['Tags']])
+
+    tags.should.have.key('a').which.should.equal('b')
+    tags.should.have.key('b').which.should.equal('b')
+    tags.should.have.key('c').which.should.equal('b')
+    tags.should.have.key('d').which.should.equal('b')
+    tags.should.have.key('e').which.should.equal('b')
+    tags.should.have.key('f').which.should.equal('b')
+    tags.should.have.key('g').which.should.equal('b')
+    tags.should.have.key('h').which.should.equal('b')
+    tags.should.have.key('i').which.should.equal('b')
+    tags.should.have.key('j').which.should.equal('c')
+    tags.shouldnt.have.key('k')
+
+    client.remove_tags(LoadBalancerNames=['my-lb'],
+                    Tags=[{
+                       'Key': 'a'
+                    }])
+
+    tags = dict([(d['Key'], d['Value']) for d in client.describe_tags(LoadBalancerNames=['my-lb'])['TagDescriptions'][0]['Tags']])
+
+    tags.shouldnt.have.key('a')
+    tags.should.have.key('b').which.should.equal('b')
+    tags.should.have.key('c').which.should.equal('b')
+    tags.should.have.key('d').which.should.equal('b')
+    tags.should.have.key('e').which.should.equal('b')
+    tags.should.have.key('f').which.should.equal('b')
+    tags.should.have.key('g').which.should.equal('b')
+    tags.should.have.key('h').which.should.equal('b')
+    tags.should.have.key('i').which.should.equal('b')
+    tags.should.have.key('j').which.should.equal('c')
+
